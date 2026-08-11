@@ -1,0 +1,104 @@
+name: publish-ghcr
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["0.0.2"]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-ghcr-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish (x86_64)
+    runs-on: ubuntu-latest
+    env:
+      APK_URL: ${{ secrets.APK_URL }}
+      IMAGE: ghcr.io/${{ github.repository_owner }}/wrapper-v2
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq unzip curl ca-certificates
+
+      - name: Make scripts executable
+        run: chmod +x tools/extract-libs.sh tools/stage-system.sh
+
+      - name: Sanity check APK_URL secret
+        run: |
+          if [[ -z "${APK_URL}" ]]; then
+            echo "::error::APK_URL secret is not set. Add it in Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+      - name: Download Apple Music artifact
+        run: |
+          mkdir -p .tmp
+          artifact=".tmp/apple-music.apk"
+          if [[ "${APK_URL,,}" == *.apkm* ]]; then
+            artifact=".tmp/apple-music.apkm"
+          fi
+          curl -fL --retry 3 --retry-delay 2 -o "${artifact}" "${APK_URL}"
+          echo "APPLE_MUSIC_ARTIFACT=${artifact}" >> "$GITHUB_ENV"
+
+      - name: Extract Apple native libs (x86_64)
+        run: |
+          ./tools/extract-libs.sh --bundle "${APPLE_MUSIC_ARTIFACT}" --arch x86_64
+
+      - name: Stage Android system binaries (x86_64)
+        run: |
+          ./tools/stage-system.sh --arch x86_64
+
+      - name: Build image
+        run: |
+          docker build \
+            --build-arg BUILD_PLATFORM=linux/amd64 \
+            --build-arg RUNTIME_PLATFORM=linux/amd64 \
+            --build-arg TARGET_ARCH=x86_64 \
+            -t wrapper-v2:ci \
+            .
+
+      - name: Smoke test (HTTP and TCP)
+        run: |
+          docker rm -f wrapper-smoke 2>/dev/null || true
+          docker run -d \
+            --name wrapper-smoke \
+            --cap-add SYS_ADMIN --cap-add SYS_CHROOT --cap-add SYS_PTRACE \
+            --security-opt apparmor=unconfined \
+            -p 8080:80 \
+            -p 11020:10020 \
+            wrapper-v2:ci
+          ok=0
+          for i in $(seq 1 40); do
+            if curl -sf http://127.0.0.1:8080/health >/dev/null; then ok=1; break; fi
+            sleep 0.5
+          done
+          if [[ "$ok" != "1" ]]; then
+            echo "::error::health did not become ready in time"
+            docker logs wrapper-smoke 2>&1 || true
+            docker rm -f wrapper-smoke 2>/dev/null || true
+            exit 1
+          fi
+          docker rm -f wrapper-smoke
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        run: |
+          docker tag wrapper-v2:ci "${IMAGE}:0.0.2"
+          docker tag wrapper-v2:ci "${IMAGE}:latest"
+          docker push "${IMAGE}:0.0.2"
+          docker push "${IMAGE}:latest"
